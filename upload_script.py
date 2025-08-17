@@ -1,0 +1,92 @@
+# upload_script.py
+import os
+import pandas as pd
+from supabase import create_client, Client
+import math
+import sys
+
+# --- Configuration ---
+# The script now gets credentials from environment variables set by GitHub Actions secrets.
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Check if secrets are loaded
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("Error: SUPABASE_URL and SUPABASE_KEY must be set as environment variables.")
+    sys.exit(1)
+
+TABLE_NAME = "btc_usdt_lob_data"
+DATA_URL = "https://raw.githubusercontent.com/OWNA/LOB/main/lob_BTCUSDT_2024-11-27%204.parquet"
+CHUNK_SIZE = 5000  # Number of rows per upload chunk
+
+def clean_column_name(col_name):
+    """Cleans a column name to be SQL-friendly."""
+    return col_name.replace('[', '_').replace(']', '').replace('.', '_')
+
+def upload_data_to_supabase():
+    """Reads data, removes duplicates, and uploads it to a Supabase table."""
+    try:
+        # --- 1. Read and prepare the data ---
+        print("Reading data from URL...")
+        df = pd.read_parquet(DATA_URL)
+        
+        # --- 2. Handle duplicates ---
+        print("Handling duplicates...")
+        initial_rows = len(df)
+        df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
+        final_rows = len(df)
+        num_duplicates_removed = initial_rows - final_rows
+        print(f"Removed {num_duplicates_removed} duplicate timestamp rows.")
+
+        # --- 3. Clean column names ---
+        print("Cleaning column names...")
+        df.columns = [clean_column_name(col) for col in df.columns]
+        
+        # --- 4. Format timestamp ---
+        print("Formatting timestamp...")
+        # Ensure the timestamp column is in datetime format before formatting
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+
+        # --- 5. Prepare for upload ---
+        total_rows = len(df)
+        num_chunks = math.ceil(total_rows / CHUNK_SIZE)
+        
+        print(f"Data prepared for upload. Total rows: {total_rows}")
+        print(f"Uploading in {num_chunks} chunks of size {CHUNK_SIZE}...")
+
+        # --- 6. Connect to Supabase ---
+        print("Connecting to Supabase...")
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # --- 7. Upload data in chunks ---
+        for i in range(num_chunks):
+            start = i * CHUNK_SIZE
+            end = start + CHUNK_SIZE
+            
+            df_chunk = df.iloc[start:end]
+            chunk_data = df_chunk.to_dict(orient='records')
+            
+            print(f"Uploading chunk {i+1}/{num_chunks} (rows {start}-{min(end, total_rows)-1})...")
+            
+            try:
+                response = supabase.table(TABLE_NAME).insert(chunk_data).execute()
+                if response.error:
+                    print(f"Error in Supabase response for chunk {i+1}: {response.error}")
+                    # Decide if you want to stop or continue on error
+                    # For this script, we will stop.
+                    return
+            except Exception as api_error:
+                print(f"An API error occurred uploading chunk {i+1}: {api_error}")
+                return
+
+            print(f"Chunk {i+1} uploaded successfully.")
+
+        print("\nAll data uploaded successfully!")
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    upload_data_to_supabase()
